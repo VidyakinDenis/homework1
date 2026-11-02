@@ -1,52 +1,30 @@
-import { Delete, Get, Injectable, Param, Patch, Post } from '@nestjs/common';
-import { UserCreate } from './dto/user-create.schema.js';
-import { Database } from '../database/database.types.js';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Kysely } from 'kysely';
 import { InjectKysely } from 'nestjs-kysely';
+import { Database } from '../database/database.types.js';
+import { UserCreate } from './dto/user-create.schema.js';
 import { UserPatch } from './dto/user-patch.schema.js';
-import { AuthService } from '../auth/auth.service.js';
+import { PasswordHelper } from './helpers/password-helper.js';
+import { UserRepository } from './user.repository.js';
 
 @Injectable()
 export class UserService {
   constructor(
     @InjectKysely() private readonly db: Kysely<Database>,
-  ) {
-  }
+    private readonly passwordHelper: PasswordHelper,
+    private readonly userRepository: UserRepository,
+  ) {}
 
   async getUserById(id: number) {
-    return await this.db
-      .selectFrom('users')
-      .selectAll()
-      .where('id', '=', id)
-      .executeTakeFirst();
-  };
+    return await this.userRepository.getUserById(id);
+  }
 
-  async getAllUsers(pageSize: number, page: number, login?: string) {
+  async getAllUsers(page: number, pageSize: number, login?: string) {
+    const offset = (page - 1) * pageSize;
 
     return await this.db.transaction().execute(async (trx) => {
-      let usersQuery = trx
-        .selectFrom('users')
-        .select(['id', 'name', 'email', 'login', 'description', 'age']);
-
-      let countQuery = trx
-        .selectFrom('users');
-
-
-      if (login) {
-        usersQuery = usersQuery.where('login', 'ilike', `%${login}%)`);
-        countQuery = countQuery.where('login', '=', login);
-
-      }
-      const { total } = await countQuery
-        .select((eb) => eb.fn.countAll<number>().as('total'))
-        .executeTakeFirstOrThrow();
-
-      const users = await usersQuery
-        .orderBy('id')
-        .limit(pageSize)
-        .offset((page - 1) * pageSize)
-        .execute();
-
+      const users = await this.userRepository.findUsersByLogin(offset, pageSize, login, trx);
+      const { total } = await this.userRepository.countUsersByLogin(login, trx);
 
       return {
         data: users,
@@ -59,36 +37,26 @@ export class UserService {
   }
 
   async createUser(dto: UserCreate) {
-    return await this.db
-      .insertInto('users')
-      .values(dto)
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const candidate = await this.userRepository.getUsersByLogin(dto.login);
+    if (candidate) throw new ConflictException('User with this login already exists');
+
+    const hashedPassword = await this.passwordHelper.hashPassword(dto.password);
+    return await this.userRepository.createUser({ ...dto, password: hashedPassword });
   }
 
   async patchUser(dto: UserPatch, id: number) {
-    return await this.db
-      .updateTable('users')
-      .set(dto)
-      .where('id', '=', id)
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const payload: UserPatch = { ...dto };
+    if (dto.password) {
+      payload.password = await this.passwordHelper.hashPassword(dto.password);
+    }
+    const user = await this.userRepository.patchUser(payload, id);
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 
   async deleteUserById(id: number) {
-    return await this.db
-      .updateTable('users')
-      .set({ 'deleted': true })
-      .where('id', '=', id)
-      .returningAll()
-      .executeTakeFirstOrThrow();
-  }
-
-  async getUsersByLogin(login: string) {
-    return await this.db
-      .selectFrom('users')
-      .selectAll()
-      .where('login', '=', login)
-      .executeTakeFirst();
+    const user = await this.userRepository.deleteUserById(id);
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 }

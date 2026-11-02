@@ -1,155 +1,132 @@
-import {
-  HttpException,
-  HttpStatus,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { Kysely } from 'kysely';
 import { Database } from '../database/database.types.js';
-import { UserCreate, UserCreateDto } from '../user/dto/user-create.schema.js';
-import { UserService } from '../user/user.service.js';
-import { JwtService } from '@nestjs/jwt';
-import bcrypt from 'bcryptjs';
+import { UserCreate } from '../user/dto/user-create.schema.js';
 import { UserLogin } from './dto/userLogin.schema.js';
-import dayjs from 'dayjs';
-import { createHash, randomUUID } from 'node:crypto';
-import { ConfigService } from '@nestjs/config';
+import { TokensHelper } from './helpers/tokens-helper.js';
+import { PasswordHelper } from '../user/helpers/password-helper.js';
+import { UserRepository } from '../user/user.repository.js';
+import { AuthRepository } from './auth.repository.js';
+import TTransaction from '../shared/TransactionType.js';
 
 @Injectable()
 export class AuthService {
   constructor(
     @InjectKysely() private readonly db: Kysely<Database>,
-    private userService: UserService,
-    private jwtService: JwtService,
-    private readonly config: ConfigService,
-  ) {
-  }
+    private readonly passwordHelper: PasswordHelper,
+    private readonly tokensHelper: TokensHelper,
+    private readonly userRepository: UserRepository,
+    private readonly authRepository: AuthRepository,
+  ) {}
 
+  private isUniqueViolation = (e: unknown) => (e as { code?: string })?.code === '23505';
 
   async login(userDto: UserLogin) {
-
     const user = await this.validateUser(userDto);
-    const tokens = await this.generateTokens(user.id);
-    await this.saveRefreshToken(tokens.refreshToken, user.id);
+    const tokens = await this.tokensHelper.generateTokens(user.id);
+    await this.saveRefreshToken(tokens.refreshToken, tokens.refreshExpiresAt, user.id);
 
     return tokens;
   }
 
-  async registration(userDto: UserCreateDto) {
-    const candidate = await this.userService.getUsersByLogin(userDto.login);
+  async registration(userDto: UserCreate) {
+    const candidate = await this.userRepository.getUsersByLogin(userDto.login);
     if (candidate) {
-      throw new HttpException('User with this login is exists', HttpStatus.CONFLICT);
+      throw new ConflictException('User with this login already exists');
     }
-    const hashedPassword = await bcrypt.hash(userDto.password, 10);
 
+    const hashedPassword = await this.passwordHelper.hashPassword(userDto.password);
+
+    try {
+      const result = await this.db.transaction().execute(async (trx) => {
+        const user = await this.userRepository.createUser(
+          { ...userDto, password: hashedPassword },
+          trx,
+        );
+
+        const tokens = await this.tokensHelper.generateTokens(user.id);
+        await this.saveRefreshToken(tokens.refreshToken, tokens.refreshExpiresAt, user.id, trx);
+
+        return { user, tokens };
+      });
+
+      return result.tokens;
+    } catch (e) {
+      if (this.isUniqueViolation(e)) {
+        throw new ConflictException('User with this login or email already exists');
+      }
+      throw e;
+    }
+  }
+
+  async logout(refreshToken: string) {
+    const hashedToken = this.tokensHelper.hashToken(refreshToken);
+    const deleted = await this.authRepository.deleteRefreshToken(hashedToken);
+  }
+
+  async refresh(refreshToken: string) {
     return await this.db.transaction().execute(async (trx) => {
-      const user = await trx
-        .insertInto('users')
-        .values({ ...userDto, password: hashedPassword })
-        .returningAll()
-        .executeTakeFirstOrThrow();
+      const hashedToken = this.tokensHelper.hashToken(refreshToken);
 
-      const tokens = await this.generateTokens(user.id);
+      const found = await this.authRepository.findRefreshToken(hashedToken, trx);
+      if (!found) {
+        throw new UnauthorizedException('token not found');
+      }
 
-      await this.saveRefreshToken(tokens.refreshToken, user.id, trx);
+      let payload: { id: number; type: string };
+      try {
+        payload = await this.tokensHelper.getPayloadFromToken(refreshToken);
+      } catch {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
+      if (payload.type !== 'refresh') throw new UnauthorizedException('Invalid token type');
+
+      const deleted = await this.authRepository.deleteRefreshToken(hashedToken, trx);
+      if (Number(deleted?.numDeletedRows ?? 0) !== 1) {
+        throw new UnauthorizedException('token not found');
+      }
+
+      const tokens = await this.tokensHelper.generateTokens(payload.id);
+      await this.saveRefreshToken(tokens.refreshToken, tokens.refreshExpiresAt, payload.id, trx);
 
       return tokens;
     });
   }
 
-  private async saveRefreshToken(token: string, user_id: number, db: Kysely<Database> = this.db) {
-    await db.insertInto('refresh_tokens')
-      .values({
-        user_id: user_id,
-        token_hash: this.hashToken(token),
-        expires_at: dayjs().add(30, 'days').toDate(),
-        revoked_at: null,
-      })
-      .execute();
-  }
+  private async saveRefreshToken(
+    token: string,
+    expiresAt: Date,
+    userId: number,
+    trx: TTransaction = this.db,
+  ) {
+    const user = await this.userRepository.MGetFullUserById(userId, trx);
+    if (!user || user.deleted) {
+      throw new UnauthorizedException('User not found or deleted');
+    }
 
-  private async generateTokens(user_id: number) {
-    const accessToken = await this.jwtService.signAsync(
-      { sub: user_id, type: 'access' },
-      { secret: this.config.getOrThrow<string>('JWT_ACCESS_KEY'), expiresIn: '15m' },
+    await this.authRepository.saveRefreshToken(
+      this.tokensHelper.hashToken(token),
+      userId,
+      expiresAt,
+      trx,
     );
-
-    const refreshToken = await this.jwtService.signAsync(
-      { sub: user_id, type: 'refresh', jti: randomUUID() },
-      { secret: this.config.getOrThrow<string>('JWT_REFRESH_KEY'), expiresIn: '30d' },
-    );
-
-    return { accessToken, refreshToken };
   }
-
-  private hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 
   private async validateUser(userDto: UserLogin) {
-    const user = await this.userService.getUsersByLogin(userDto.login);
-    if (!user) {
+    const user = await this.userRepository.getFullUserByLogin(userDto.login);
+    if (!user || user.deleted) {
       throw new UnauthorizedException('Неверный логин или пароль');
     }
 
-    const passwordEqual = await bcrypt.compare(userDto.password, user.password);
+    const passwordEqual = await this.passwordHelper.verifyPasswords(
+      userDto.password,
+      user.password,
+    );
     if (!passwordEqual) {
       throw new UnauthorizedException('Неверный логин или пароль');
     }
 
     return user;
-  }
-
-  async logout(refreshToken: string) {
-    const hashedToken = this.hashToken(refreshToken);
-
-    const deleted = await this.db
-      .deleteFrom('refresh_tokens')
-      .where('token_hash', '=', hashedToken)
-      .executeTakeFirst();
-
-    if (deleted.numDeletedRows <= 0) return HttpStatus.NOT_FOUND;
-    return HttpStatus.NO_CONTENT;
-
-  }
-
-  async getPayloadFromToken(token: string): Promise <{ sub: number, type: 'refresh' | "access", jti?: string }> {
-    return await this.jwtService.verifyAsync(token, {
-      secret: this.config.getOrThrow<string>('JWT_REFRESH_KEY'),
-    });
-  }
-
-  async refresh(refreshToken: string) {
-
-    return await this.db.transaction().execute(async (trx) => {
-      const hashedToken = this.hashToken(refreshToken);
-
-      const foundedToken = await trx
-        .selectFrom('refresh_tokens')
-        .selectAll()
-        .where('token_hash', '=', hashedToken)
-        .executeTakeFirst();
-
-      if (!foundedToken) throw new UnauthorizedException('token not found');
-
-      let payload: { sub: number; type: string; jti?: string };
-      try {
-        payload = await this.getPayloadFromToken(refreshToken)
-      } catch {
-        throw new UnauthorizedException('Invalid refresh token');
-      }
-
-      await trx
-        .deleteFrom('refresh_tokens')
-        .where('token_hash', '=', hashedToken)
-        .executeTakeFirst();
-
-      if (payload.type !== 'refresh') throw new UnauthorizedException('Invalid token type');
-      const tokens = await this.generateTokens(payload.sub);
-      await this.saveRefreshToken(tokens.refreshToken, payload.sub, trx);
-
-
-
-      return tokens;
-    });
   }
 }

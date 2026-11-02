@@ -1,151 +1,215 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { BadRequestException, HttpStatus, UnauthorizedException, ConflictException } from '@nestjs/common';
-import { AuthController } from '../auth.controller.js';
-import { AuthService } from '../auth.service.js';
-import type { UserCreateDto } from '../../user/dto/user-create.schema.js';
-import type { UserLoginDto } from '../dto/userLogin.schema.js';
-import type { RefreshTokenDto } from '../dto/tokens.schema.js';
-import { makeUser } from '../../shared/testFactories.js';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import request from 'supertest';
+import { createHttpTestApp, jwtCfg } from '../../shared/httpTestApp.js';
+import { makeUserRow } from '../../shared/testFactories.js';
 
-describe('AuthController', () => {
-  let controller: AuthController;
+const registrationBody = {
+  name: 'Denis',
+  login: 'denis',
+  password: 'secret123',
+  email: 'denis@example.com',
+  age: 25,
+  description: 'about',
+};
 
-  const authService = {
-    login: vi.fn(),
-    registration: vi.fn(),
-    logout: vi.fn(),
-    refresh: vi.fn(),
-  };
+describe('HTTP: /auth', () => {
+  let ctx: Awaited<ReturnType<typeof createHttpTestApp>>;
+  const server = () => ctx.app.getHttpServer();
 
-  const tokens = { accessToken: 'access.jwt', refreshToken: 'refresh.jwt' };
-
-  beforeEach(async () => {
-    vi.resetAllMocks();
-
-    const moduleRef = await Test.createTestingModule({
-      controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: authService }],
-    }).compile();
-
-    controller = moduleRef.get(AuthController);
+  beforeAll(async () => {
+    ctx = await createHttpTestApp();
   });
-
-  describe('login', () => {
-    it('передаёт данные в сервис и возвращает токены', async () => {
-      authService.login.mockResolvedValue(tokens);
-
-      const result = await controller.login({ login: 'denis', password: 'secret123' } as UserLoginDto);
-
-      expect(authService.login).toHaveBeenCalledWith({ login: 'denis', password: 'secret123' });
-      expect(result).toEqual(tokens);
-    });
-
-    it('пробрасывает 401 от сервиса (неверный логин или пароль)', async () => {
-      authService.login.mockRejectedValue(new UnauthorizedException());
-
-      await expect(
-        controller.login({ login: 'denis', password: 'wrong' } as UserLoginDto),
-      ).rejects.toThrow(UnauthorizedException);
-    });
-
-    it.each([
-      ['пустое тело', {}],
-      ['нет пароля', { login: 'denis' }],
-      ['нет логина', { password: 'secret123' }],
-      ['логин не строка', { login: 123, password: 'secret123' }],
-    ])('400: %s', async (_name, body) => {
-      await expect(controller.login(body as unknown as UserLoginDto)).rejects.toThrow(BadRequestException);
-      expect(authService.login).not.toHaveBeenCalled();
-    });
+  afterAll(async () => {
+    await ctx.app.close();
   });
+  beforeEach(() => ctx.resetMocks());
 
-  describe('registration', () => {
-    it('регистрирует пользователя и возвращает токены', async () => {
-      authService.registration.mockResolvedValue(tokens);
+  const refreshCookieOf = (res: request.Response) =>
+    String(res.headers['set-cookie']).match(/refresh_token=([^;]+)/)?.[1];
 
-      const result = await controller.registration(makeUser({ login: 'denis' }) as UserCreateDto);
+  describe('POST /auth/login', () => {
+    it('200: access в теле, refresh в httpOnly cookie', async () => {
+      const password = 'secret123';
+      const user = makeUserRow({ id: 3, password: await ctx.passwords.hashPassword(password) });
+      ctx.users.getFullUserByLogin.mockResolvedValue(user);
+      ctx.users.MGetFullUserById.mockResolvedValue(user);
 
-      expect(authService.registration).toHaveBeenCalledWith(expect.objectContaining({ login: 'denis' }));
-      expect(result).toEqual(tokens);
+      const res = await request(server())
+        .post('/api/auth/login')
+        .send({ login: user.login, password })
+        .expect(200);
+
+      expect(res.body).toEqual({ accessToken: expect.any(String) });
+      const payload = await ctx.jwt.verifyAsync(res.body.accessToken, {
+        secret: jwtCfg.accessSecret,
+      });
+      expect(payload).toMatchObject({ id: 3, type: 'access' });
+      expect(String(res.headers['set-cookie'])).toMatch(/refresh_token=.*HttpOnly/);
+      expect(ctx.authRepo.saveRefreshToken.mock.calls[0][0]).toBe(
+        ctx.tokensHelper.hashToken(refreshCookieOf(res)!),
+      );
     });
 
-    it('подставляет deleted=false по умолчанию', async () => {
-      authService.registration.mockResolvedValue(tokens);
-      const { deleted, ...body } = makeUser();
+    it('пароль с пробелами по краям не обрезается', async () => {
+      const password = ' secret123 ';
+      const user = makeUserRow({ id: 3, password: await ctx.passwords.hashPassword(password) });
+      ctx.users.getFullUserByLogin.mockResolvedValue(user);
+      ctx.users.MGetFullUserById.mockResolvedValue(user);
 
-      await controller.registration(body as UserCreateDto);
-
-      expect(authService.registration).toHaveBeenCalledWith(expect.objectContaining({ deleted: false }));
+      await request(server())
+        .post('/api/auth/login')
+        .send({ login: user.login, password })
+        .expect(200);
     });
 
-    it('пробрасывает 409, если логин занят', async () => {
-      authService.registration.mockRejectedValue(new ConflictException());
+    it('401 для неверного пароля', async () => {
+      const user = makeUserRow({ password: await ctx.passwords.hashPassword('right-password') });
+      ctx.users.getFullUserByLogin.mockResolvedValue(user);
 
-      await expect(controller.registration(makeUser() as UserCreateDto)).rejects.toThrow(ConflictException);
+      await request(server())
+        .post('/api/auth/login')
+        .send({ login: user.login, password: 'wrong-password' })
+        .expect(401);
     });
 
-    it.each([
-      ['короткий логин', { login: 'ab' }],
-      ['короткий пароль', { password: '12345' }],
-      ['невалидный email', { email: 'not-an-email' }],
-      ['отрицательный возраст', { age: -1 }],
-    ])('400: %s', async (_name, override) => {
-      await expect(
-        controller.registration(makeUser(override) as UserCreateDto),
-      ).rejects.toThrow(BadRequestException);
-      expect(authService.registration).not.toHaveBeenCalled();
+    it('401 для удалённого пользователя', async () => {
+      ctx.users.getFullUserByLogin.mockResolvedValue(
+        makeUserRow({ password: await ctx.passwords.hashPassword('secret123'), deleted: true }),
+      );
+
+      await request(server())
+        .post('/api/auth/login')
+        .send({ login: 'denis', password: 'secret123' })
+        .expect(401);
     });
 
-    it('400 на пустое тело', async () => {
-      await expect(controller.registration({} as UserCreateDto)).rejects.toThrow(BadRequestException);
-      expect(authService.registration).not.toHaveBeenCalled();
+    it('400 при пустом теле', async () => {
+      await request(server()).post('/api/auth/login').send({}).expect(400);
     });
   });
 
-  describe('logout', () => {
-    it('передаёт refresh-токен в сервис', async () => {
-      authService.logout.mockResolvedValue(HttpStatus.NO_CONTENT);
+  describe('POST /auth/registration', () => {
+    it('201: описание 1000 символов, поле deleted игнорируется', async () => {
+      const user = makeUserRow({ id: 9 });
+      ctx.users.getUsersByLogin.mockResolvedValue(undefined);
+      ctx.users.createUser.mockResolvedValue(user);
+      ctx.users.MGetFullUserById.mockResolvedValue(user);
 
-      await controller.logout({ refreshToken: 'refresh.jwt' } as RefreshTokenDto);
+      const res = await request(server())
+        .post('/api/auth/registration')
+        .send({ ...registrationBody, description: 'x'.repeat(1000), deleted: true })
+        .expect(201);
 
-      expect(authService.logout).toHaveBeenCalledWith('refresh.jwt');
+      expect(res.body).toEqual({ accessToken: expect.any(String) });
+      const [created] = ctx.users.createUser.mock.calls[0];
+      expect(created).not.toHaveProperty('deleted');
+      expect(created.password).not.toBe(registrationBody.password);
     });
 
-    it.each([
-      ['пустое тело', {}],
-      ['токен не строка', { refreshToken: 123 }],
-    ])('400: %s', async (_name, body) => {
-      await expect(controller.logout(body as unknown as RefreshTokenDto)).rejects.toThrow(BadRequestException);
-      expect(authService.logout).not.toHaveBeenCalled();
+    it('409, если логин занят', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue({ id: 1 });
+
+      await request(server()).post('/api/auth/registration').send(registrationBody).expect(409);
+    });
+
+    it('409, если БД вернула нарушение unique при гонке', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue(undefined);
+      ctx.users.createUser.mockRejectedValue({ code: '23505' });
+
+      await request(server()).post('/api/auth/registration').send(registrationBody).expect(409);
+    });
+
+    it('400 для описания длиннее 1000 символов', async () => {
+      await request(server())
+        .post('/api/auth/registration')
+        .send({ ...registrationBody, description: 'x'.repeat(1001) })
+        .expect(400);
     });
   });
 
-  describe('refresh', () => {
-    it('передаёт токен в сервис и возвращает новую пару', async () => {
-      const newTokens = { accessToken: 'new.access', refreshToken: 'new.refresh' };
-      authService.refresh.mockResolvedValue(newTokens);
+  describe('POST /auth/refresh', () => {
+    it('200 без access-токена: ротация, новый refresh хешируется один раз', async () => {
+      const { refreshToken } = await ctx.tokensHelper.generateTokens(3);
+      ctx.authRepo.findRefreshToken.mockResolvedValue({ id: 1, user_id: 3 });
+      ctx.authRepo.deleteRefreshToken.mockResolvedValue({ numDeletedRows: 1n });
+      ctx.users.MGetFullUserById.mockResolvedValue(makeUserRow({ id: 3 }));
 
-      const result = await controller.refresh({ refreshToken: 'refresh.jwt' } as RefreshTokenDto);
+      const res = await request(server())
+        .post('/api/auth/refresh')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(200);
 
-      expect(authService.refresh).toHaveBeenCalledWith('refresh.jwt');
-      expect(result).toEqual(newTokens);
+      expect(res.body).toEqual({ accessToken: expect.any(String) });
+      expect(ctx.authRepo.deleteRefreshToken.mock.calls[0][0]).toBe(
+        ctx.tokensHelper.hashToken(refreshToken),
+      );
+      expect(ctx.authRepo.saveRefreshToken.mock.calls[0][0]).toBe(
+        ctx.tokensHelper.hashToken(refreshCookieOf(res)!),
+      );
     });
 
-    it('пробрасывает 401 от сервиса (токен не найден или невалиден)', async () => {
-      authService.refresh.mockRejectedValue(new UnauthorizedException('token not found'));
-
-      await expect(
-        controller.refresh({ refreshToken: 'bad' } as RefreshTokenDto),
-      ).rejects.toThrow(UnauthorizedException);
+    it('401 без cookie', async () => {
+      await request(server()).post('/api/auth/refresh').expect(401);
     });
 
-    it.each([
-      ['пустое тело', {}],
-      ['токен не строка', { refreshToken: 123 }],
-    ])('400: %s', async (_name, body) => {
-      await expect(controller.refresh(body as unknown as RefreshTokenDto)).rejects.toThrow(BadRequestException);
-      expect(authService.refresh).not.toHaveBeenCalled();
+    it('401 при проигранной гонке (токен уже удалён)', async () => {
+      const { refreshToken } = await ctx.tokensHelper.generateTokens(3);
+      ctx.authRepo.findRefreshToken.mockResolvedValue({ id: 1, user_id: 3 });
+      ctx.authRepo.deleteRefreshToken.mockResolvedValue({ numDeletedRows: 0n });
+
+      await request(server())
+        .post('/api/auth/refresh')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(401);
+    });
+
+    it('401, если пользователь удалён', async () => {
+      const { refreshToken } = await ctx.tokensHelper.generateTokens(3);
+      ctx.authRepo.findRefreshToken.mockResolvedValue({ id: 1, user_id: 3 });
+      ctx.authRepo.deleteRefreshToken.mockResolvedValue({ numDeletedRows: 1n });
+      ctx.users.MGetFullUserById.mockResolvedValue(makeUserRow({ id: 3, deleted: true }));
+
+      await request(server())
+        .post('/api/auth/refresh')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(401);
+    });
+
+    it('401, если вместо refresh передан access-токен', async () => {
+      const { accessToken } = await ctx.tokensHelper.generateTokens(3);
+      ctx.authRepo.findRefreshToken.mockResolvedValue({ id: 1, user_id: 3 });
+
+      await request(server())
+        .post('/api/auth/refresh')
+        .set('Cookie', `refresh_token=${accessToken}`)
+        .expect(401);
+    });
+  });
+
+  describe('POST /auth/logout', () => {
+    it('отзывает refresh по хешу и чистит cookie, access не нужен', async () => {
+      const { refreshToken } = await ctx.tokensHelper.generateTokens(3);
+      ctx.authRepo.deleteRefreshToken.mockResolvedValue({ numDeletedRows: 1n });
+
+      const res = await request(server())
+        .post('/api/auth/logout')
+        .set('Cookie', `refresh_token=${refreshToken}`);
+
+      expect(res.status).toBeLessThan(300);
+      expect(ctx.authRepo.deleteRefreshToken).toHaveBeenCalledWith(
+        ctx.tokensHelper.hashToken(refreshToken),
+      );
+      expect(String(res.headers['set-cookie'])).toMatch(/refresh_token=;/);
+    });
+  });
+
+  it('единый формат ошибок: { statusCode, error, message }', async () => {
+    const res = await request(server()).get('/api/users/my').expect(401);
+
+    expect(res.body).toEqual({
+      statusCode: 401,
+      error: 'Unauthorized',
+      message: 'user is not authorized',
     });
   });
 });

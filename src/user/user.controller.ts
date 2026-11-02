@@ -1,129 +1,106 @@
 import {
-  BadRequestException,
   Body,
   Controller,
   Delete,
-  Get, NotFoundException,
+  ForbiddenException,
+  Get,
+  NotFoundException,
   Param,
   ParseIntPipe,
   Patch,
-  Post, Query,
+  Post,
+  Query,
   Req,
-  UseGuards,
 } from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiCreatedResponse,
+  ApiOkResponse,
+  ApiOperation,
+  ApiParam,
+  ApiQuery,
+} from '@nestjs/swagger';
 import { UserService } from './user.service.js';
-import { UserPatch, UserPatchSchema } from './dto/user-patch.schema.js';
-import { UserCreateDto, UserCreateSchema } from './dto/user-create.schema.js';
-import { User } from './dto/user.table.js';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
-import { ApiBearerAuth, ApiBody, ApiHeader, ApiOkResponse, ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
+import { UserCreateDto } from './dto/user-create.schema.js';
 import { UserResponseDto } from './dto/user-response.dto.js';
-import { UserIdParamSchema, UserIdParamsDto, UsersListDto, UsersListSchema } from './dto/user-params.schema.js';
+import { UsersListDto } from './dto/user-params.schema.js';
 import { UserPatchDto } from './dto/user-patch.schema.js';
+import { Public } from '../auth/guards/public.decorator.js';
+import type { AuthRequest } from '../auth/types/auth-request.js';
 
 @Controller('users')
 export class UserController {
-  constructor(private readonly userService: UserService) {
-  }
+  constructor(private readonly userService: UserService) {}
 
   @Get('/my')
-  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOkResponse({ type: UserResponseDto })
   @ApiOperation({
     summary: 'Получить своего пользователя',
     description: 'Возвращает вашего пользователя',
   })
-  @ApiOkResponse({ type: UserResponseDto })
-  @ApiBearerAuth()
-  async getMyProfile(@Req() req: { user: { id: number } }) {
+  async getMyProfile(@Req() req: AuthRequest) {
     const user = await this.userService.getUserById(req.user.id);
     if (!user) throw new NotFoundException('User not found');
-    return this.toPublic(user);
+    return user;
   }
 
   @Get('/:id')
-  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOkResponse({ type: UserResponseDto })
   @ApiParam({ name: 'id', required: true, type: Number })
-  @ApiOperation({
-    summary: 'Получить пользователя',
-    description: 'Возвращает пользователя',
-  })
-  async getUserById(@Param("id", ParseIntPipe) id: number) {
-    const safeParams = UserIdParamSchema.safeParse({ id });
-    if (!safeParams.success) throw new BadRequestException(safeParams.error.flatten());
-    const user = await this.userService.getUserById(safeParams.data.id);
+  @ApiOperation({ summary: 'Получить пользователя', description: 'Возвращает пользователя' })
+  async getUserById(@Param('id', ParseIntPipe) id: number) {
+    const user = await this.userService.getUserById(id);
     if (!user) throw new NotFoundException('User not found');
-    return this.toPublic(user);
+    return user;
   }
 
   @Get('/')
-  @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Получить всех пользователей',
-    description: 'Возвращает список всех строк таблицы users',
+    description: 'Возвращает страницу активных пользователей с необязательным поиском по логину',
   })
   @ApiQuery({ name: 'page', required: false, example: 1 })
   @ApiQuery({ name: 'pageSize', required: false, example: 20 })
   @ApiQuery({ name: 'login', required: false, example: 'anna_login' })
-  async getAllUsers(@Query() query: UsersListDto) {
-    const safeParams = UsersListSchema.safeParse(query);
-    if (!safeParams.success) throw new BadRequestException(safeParams.error?.flatten());
-    const { page, pageSize, login } = safeParams.data;
-    const users = await this.userService.getAllUsers(page, pageSize, login);
-    if (!users) throw new NotFoundException('Users not found');
-    return users;
+  async getAllUsers(@Query() { page, pageSize, login }: UsersListDto) {
+    return await this.userService.getAllUsers(page, pageSize, login);
   }
 
-  @ApiOperation({
-    summary: 'Создать пользователя',
-    description: 'Создаёт пользорвателя',
-  })
   @Post('/create')
-  @ApiOkResponse({ type: UserResponseDto })
-  async CreateUser(@Body() body: UserCreateDto) {
-    const result = UserCreateSchema.safeParse(body);
-    if (!result.success) {
-      throw new BadRequestException(result.error.flatten());
-    }
-    return await this.userService.createUser(result.data);
+  @Public()
+  @ApiCreatedResponse({ type: UserResponseDto })
+  @ApiOperation({ summary: 'Создать пользователя', description: 'Создаёт пользователя' })
+  async createUser(@Body() body: UserCreateDto) {
+    return await this.userService.createUser(body);
   }
 
   @Patch('/:id')
   @ApiBearerAuth()
-  @ApiOperation({
-    summary: 'Получить пользователя',
-    description: 'Возвращает пользователя',
-  })
   @ApiOkResponse({ type: UserResponseDto })
-  @ApiParam({ name: 'id', required: true })
-  async patchUser(@Param("id", ParseIntPipe) id: number, @Body() body: UserPatchDto) {
-    const safeParams = UserIdParamSchema.safeParse({ id });
-    if (!safeParams.success) throw new BadRequestException(safeParams.error.flatten());
-    const safeBody = UserPatchSchema.safeParse(body);
-    if (!safeBody.success) throw new BadRequestException(safeBody.error.flatten());
-    const user = await this.userService.patchUser(safeBody.data, safeParams.data.id);
-    return this.toPublic(user);
-  }
-
-
+  @ApiParam({ name: 'id', required: true, type: Number })
   @ApiOperation({
-    summary: 'Удалить пользвателя',
-    description: 'удаляет пользователя',
+    summary: 'Изменить пользователя',
+    description: 'Изменяет данные своего пользователя',
   })
-  @Delete('/:id')
-  @UseGuards(JwtAuthGuard)
-  @ApiQuery({ name: 'id', required: true })
-  @ApiBearerAuth()
-  async deleteUserById(@Param('id', ParseIntPipe) id: number) {
-    const safeParams = UserIdParamSchema.safeParse({ id });
-    if (!safeParams.success) throw new BadRequestException(safeParams.error.flatten());
-    return await this.userService.deleteUserById(safeParams.data.id);
+  async patchUser(
+    @Req() req: AuthRequest,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: UserPatchDto,
+  ) {
+    if (req.user.id !== id) throw new ForbiddenException("You can't patch this user");
+    return await this.userService.patchUser(body, id);
   }
 
-  private toPublic(user: User) {
-    const { password, ...publicUser } = user;
-    return publicUser;
+  @Delete('/:id')
+  @ApiBearerAuth()
+  @ApiOkResponse({ type: UserResponseDto })
+  @ApiParam({ name: 'id', required: true, type: Number })
+  @ApiOperation({ summary: 'Удалить пользователя', description: 'Удаляет свой аккаунт' })
+  async deleteUserById(@Req() req: AuthRequest, @Param('id', ParseIntPipe) id: number) {
+    if (req.user.id !== id) throw new ForbiddenException("You can't delete this user");
+    return await this.userService.deleteUserById(id);
   }
 }

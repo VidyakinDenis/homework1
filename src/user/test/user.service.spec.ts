@@ -1,232 +1,124 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
-import { createKyselyMock, makeUser, makeUserRow } from '../../shared/testFactories.js';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { UserService } from '../user.service.js';
+import { UserRepository } from '../user.repository.js';
+import { PasswordHelper } from '../helpers/password-helper.js';
 import type { Database } from '../../database/database.types.js';
-import type { UserPatch } from '../dto/user-patch.schema.js';
+import { createDbMock, makeUserRow, toPublicUser } from '../../shared/testFactories.js';
+
+const dto = {
+  name: 'Denis',
+  login: 'denis',
+  password: 'secret123',
+  email: 'denis@example.com',
+  age: 25,
+  description: 'about',
+};
 
 describe('UserService', () => {
-  let db: ReturnType<typeof createKyselyMock>;
+  let db: ReturnType<typeof createDbMock>;
+  let repo: Record<keyof UserRepository, ReturnType<typeof vi.fn>>;
+  let passwords: { hashPassword: ReturnType<typeof vi.fn> };
   let service: UserService;
 
   beforeEach(() => {
-    db = createKyselyMock();
-    service = new UserService(db as unknown as Kysely<Database>);
-  });
-
-  describe('getUserById', () => {
-    it('возвращает пользователя по id', async () => {
-      const row = makeUserRow({ id: 5 });
-      db.executeTakeFirst.mockResolvedValue(row);
-
-      const result = await service.getUserById(5);
-
-      expect(db.selectFrom).toHaveBeenCalledWith('users');
-      expect(db.selectAll).toHaveBeenCalled();
-      expect(db.where).toHaveBeenCalledWith('id', '=', 5);
-      expect(db.executeTakeFirst).toHaveBeenCalled();
-      expect(result).toEqual(row);
-    });
-
-    it('возвращает undefined, если пользователь не найден', async () => {
-      db.executeTakeFirst.mockResolvedValue(undefined);
-
-      const result = await service.getUserById(999);
-
-      expect(result).toBeUndefined();
-    });
-
-    it('пробрасывает ошибку базы данных', async () => {
-      const error = new Error('Database error');
-      db.executeTakeFirst.mockRejectedValue(error);
-
-      await expect(service.getUserById(5)).rejects.toThrow(error);
-    });
+    db = createDbMock();
+    repo = {
+      getUserById: vi.fn(),
+      findUsersByLogin: vi.fn(),
+      countUsersByLogin: vi.fn(),
+      getUsersByLogin: vi.fn(),
+      createUser: vi.fn(),
+      patchUser: vi.fn(),
+      deleteUserById: vi.fn(),
+    } as unknown as typeof repo;
+    passwords = { hashPassword: vi.fn().mockResolvedValue('HASH') };
+    service = new UserService(
+      db as unknown as Kysely<Database>,
+      passwords as unknown as PasswordHelper,
+      repo as unknown as UserRepository,
+    );
   });
 
   describe('getAllUsers', () => {
-    it('возвращает пользователей с пагинацией', async () => {
-      const users = [
-        makeUserRow({ id: 1 }),
-        makeUserRow({ id: 2 }),
-      ];
+    it('первая страница по умолчанию: offset 0, limit pageSize', async () => {
+      repo.findUsersByLogin.mockResolvedValue([]);
+      repo.countUsersByLogin.mockResolvedValue({ total: 0 });
 
-      db.executeTakeFirstOrThrow.mockResolvedValue({ total: 10 });
-      db.execute.mockResolvedValue(users);
+      await service.getAllUsers(1, 20);
 
-      const result = await service.getAllUsers(2, 1);
-
-      expect(db.transaction).toHaveBeenCalled();
-      expect(result).toEqual({
-        data: users,
-        page: 1,
-        pageSize: 2,
-        total: 10,
-        totalPages: 5,
-      });
+      expect(repo.findUsersByLogin).toHaveBeenCalledWith(0, 20, undefined, expect.anything());
     });
 
-    it('применяет фильтр по login', async () => {
-      const users = [makeUserRow({ id: 1, login: 'john' })];
+    it('вторая страница: offset = (page - 1) * pageSize', async () => {
+      const users = [toPublicUser(makeUserRow()), toPublicUser(makeUserRow())];
+      repo.findUsersByLogin.mockResolvedValue(users);
+      repo.countUsersByLogin.mockResolvedValue({ total: '12' });
 
-      db.executeTakeFirstOrThrow.mockResolvedValue({ total: 1 });
-      db.execute.mockResolvedValue(users);
+      const result = await service.getAllUsers(2, 5, 'den');
 
-      const result = await service.getAllUsers(10, 1, 'john');
-
-      expect(db.where).toHaveBeenCalledWith(
-        'login',
-        'ilike',
-        '%john%)',
-      );
-      expect(db.where).toHaveBeenCalledWith('login', '=', 'john');
-      expect(result.data).toEqual(users);
-    });
-
-    it('рассчитывает offset для второй страницы', async () => {
-      db.executeTakeFirstOrThrow.mockResolvedValue({ total: 25 });
-      db.execute.mockResolvedValue([]);
-
-      await service.getAllUsers(10, 2);
-
-      expect(db.limit).toHaveBeenCalledWith(10);
-      expect(db.offset).toHaveBeenCalledWith(10);
-      expect(db.orderBy).toHaveBeenCalledWith('id');
-    });
-
-    it('возвращает ноль страниц, если пользователей нет', async () => {
-      db.executeTakeFirstOrThrow.mockResolvedValue({ total: 0 });
-      db.execute.mockResolvedValue([]);
-
-      const result = await service.getAllUsers(10, 1);
-
-      expect(result).toEqual({
-        data: [],
-        page: 1,
-        pageSize: 10,
-        total: 0,
-        totalPages: 0,
-      });
-    });
-
-    it('округляет количество страниц вверх', async () => {
-      db.executeTakeFirstOrThrow.mockResolvedValue({ total: 11 });
-      db.execute.mockResolvedValue([]);
-
-      const result = await service.getAllUsers(5, 1);
-
-      expect(result.totalPages).toBe(3);
-    });
-
-    it('пробрасывает ошибку при получении количества пользователей', async () => {
-      const error = new Error('Count query failed');
-      db.executeTakeFirstOrThrow.mockRejectedValue(error);
-
-      await expect(service.getAllUsers(10, 1)).rejects.toThrow(error);
+      expect(repo.findUsersByLogin).toHaveBeenCalledWith(5, 5, 'den', expect.anything());
+      expect(repo.countUsersByLogin).toHaveBeenCalledWith('den', expect.anything());
+      expect(result).toEqual({ data: users, page: 2, pageSize: 5, total: 12, totalPages: 3 });
     });
   });
 
   describe('createUser', () => {
-    it('создаёт пользователя и возвращает созданную строку', async () => {
-      const user = makeUser();
-      const userRow = makeUserRow();
+    it('хеширует пароль перед записью', async () => {
+      repo.getUsersByLogin.mockResolvedValue(undefined);
+      repo.createUser.mockResolvedValue({ id: 1 });
 
-      db.executeTakeFirstOrThrow.mockResolvedValue(userRow);
+      await service.createUser(dto);
 
-      const result = await service.createUser(user);
-
-      expect(db.insertInto).toHaveBeenCalledWith('users');
-      expect(db.values).toHaveBeenCalledWith(user);
-      expect(db.returningAll).toHaveBeenCalled();
-      expect(db.executeTakeFirstOrThrow).toHaveBeenCalled();
-      expect(result).toEqual(userRow);
+      expect(repo.createUser).toHaveBeenCalledWith({ ...dto, password: 'HASH' });
     });
 
-    it('пробрасывает ошибку при создании пользователя', async () => {
-      const error = new Error('Insert failed');
-      db.executeTakeFirstOrThrow.mockRejectedValue(error);
+    it('409, если логин занят', async () => {
+      repo.getUsersByLogin.mockResolvedValue({ id: 1 });
 
-      await expect(service.createUser(makeUser())).rejects.toThrow(error);
+      await expect(service.createUser(dto)).rejects.toBeInstanceOf(ConflictException);
+      expect(repo.createUser).not.toHaveBeenCalled();
     });
   });
 
   describe('patchUser', () => {
-    it('обновляет пользователя и возвращает обновлённую строку', async () => {
-      const id = 5;
-      const dto = {
-        name: 'Updated name',
-      } as UserPatch;
-      const updatedUser = makeUserRow({ id, name: 'Updated name' });
+    it('хеширует новый пароль', async () => {
+      repo.patchUser.mockResolvedValue({ id: 1 });
 
-      db.executeTakeFirstOrThrow.mockResolvedValue(updatedUser);
+      await service.patchUser({ password: 'new-password', name: 'N' }, 1);
 
-      const result = await service.patchUser(dto, id);
-
-      expect(db.updateTable).toHaveBeenCalledWith('users');
-      expect(db.set).toHaveBeenCalledWith(dto);
-      expect(db.where).toHaveBeenCalledWith('id', '=', id);
-      expect(db.returningAll).toHaveBeenCalled();
-      expect(result).toEqual(updatedUser);
+      expect(passwords.hashPassword).toHaveBeenCalledWith('new-password');
+      expect(repo.patchUser).toHaveBeenCalledWith({ password: 'HASH', name: 'N' }, 1);
     });
 
-    it('пробрасывает ошибку при обновлении пользователя', async () => {
-      const error = new Error('Update failed');
-      db.executeTakeFirstOrThrow.mockRejectedValue(error);
+    it('без пароля не вызывает хеширование', async () => {
+      repo.patchUser.mockResolvedValue({ id: 1 });
 
-      await expect(
-        service.patchUser({ name: 'Updated name' } as UserPatch, 5),
-      ).rejects.toThrow(error);
+      await service.patchUser({ name: 'N' }, 1);
+
+      expect(passwords.hashPassword).not.toHaveBeenCalled();
+    });
+
+    it('404, если пользователя нет', async () => {
+      repo.patchUser.mockResolvedValue(undefined);
+
+      await expect(service.patchUser({ name: 'N' }, 1)).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 
   describe('deleteUserById', () => {
-    it('помечает пользователя удалённым и возвращает обновлённую строку', async () => {
-      const deletedUser = makeUserRow({ id: 5, deleted: true });
-      db.executeTakeFirstOrThrow.mockResolvedValue(deletedUser);
+    it('возвращает публичные данные удалённого', async () => {
+      const user = toPublicUser(makeUserRow());
+      repo.deleteUserById.mockResolvedValue(user);
 
-      const result = await service.deleteUserById(5);
-
-      expect(db.updateTable).toHaveBeenCalledWith('users');
-      expect(db.set).toHaveBeenCalledWith({ deleted: true });
-      expect(db.where).toHaveBeenCalledWith('id', '=', 5);
-      expect(db.returningAll).toHaveBeenCalled();
-      expect(result).toEqual(deletedUser);
+      await expect(service.deleteUserById(user.id)).resolves.toEqual(user);
     });
 
-    it('пробрасывает ошибку, если удаление не удалось', async () => {
-      const error = new Error('Delete failed');
-      db.executeTakeFirstOrThrow.mockRejectedValue(error);
+    it('404, если пользователь не найден или уже удалён', async () => {
+      repo.deleteUserById.mockResolvedValue(undefined);
 
-      await expect(service.deleteUserById(999)).rejects.toThrow(error);
-    });
-  });
-
-  describe('getUsersByLogin', () => {
-    it('возвращает пользователя по login', async () => {
-      const user = makeUserRow({ login: 'john' });
-      db.executeTakeFirst.mockResolvedValue(user);
-
-      const result = await service.getUsersByLogin('john');
-
-      expect(db.selectFrom).toHaveBeenCalledWith('users');
-      expect(db.selectAll).toHaveBeenCalled();
-      expect(db.where).toHaveBeenCalledWith('login', '=', 'john');
-      expect(result).toEqual(user);
-    });
-
-    it('возвращает undefined, если пользователь с таким login не найден', async () => {
-      db.executeTakeFirst.mockResolvedValue(undefined);
-
-      const result = await service.getUsersByLogin('unknown');
-
-      expect(result).toBeUndefined();
-    });
-
-    it('пробрасывает ошибку при поиске пользователя', async () => {
-      const error = new Error('Select failed');
-      db.executeTakeFirst.mockRejectedValue(error);
-
-      await expect(service.getUsersByLogin('john')).rejects.toThrow(error);
+      await expect(service.deleteUserById(1)).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 });

@@ -1,432 +1,184 @@
-import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { HttpException, HttpStatus, UnauthorizedException } from '@nestjs/common';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
-import type { JwtService } from '@nestjs/jwt';
-import type { ConfigService } from '@nestjs/config';
-import { createHash } from 'node:crypto';
-import bcrypt from 'bcryptjs';
-
+import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { AuthService } from '../auth.service.js';
-import { UserService } from '../../user/user.service.js';
+import { AuthRepository } from '../auth.repository.js';
+import { TokensHelper } from '../helpers/tokens-helper.js';
+import { PasswordHelper } from '../../user/helpers/password-helper.js';
+import { UserRepository } from '../../user/user.repository.js';
 import type { Database } from '../../database/database.types.js';
-import { createKyselyMock } from '../../shared/testFactories.js';
-import type { UserCreateDto } from '../../user/dto/user-create.schema.js';
-import type { UserLogin } from '../dto/userLogin.schema.js';
+import { createDbMock, makeUserRow } from '../../shared/testFactories.js';
+
+const expiresAt = new Date('2030-01-01T00:00:00Z');
+const tokens = { accessToken: 'access', refreshToken: 'refresh-NEW', refreshExpiresAt: expiresAt };
+const hash = (t: string) => `hash(${t})`;
+
+const dto = {
+  name: 'Denis',
+  login: 'denis',
+  password: 'secret123',
+  email: 'denis@example.com',
+  age: 25,
+  description: 'about',
+};
 
 describe('AuthService', () => {
-  let db: ReturnType<typeof createKyselyMock>;
+  let db: ReturnType<typeof createDbMock>;
+  let users: Record<string, ReturnType<typeof vi.fn>>;
+  let authRepo: Record<string, ReturnType<typeof vi.fn>>;
+  let tokensHelper: Record<string, ReturnType<typeof vi.fn>>;
+  let passwords: Record<string, ReturnType<typeof vi.fn>>;
   let service: AuthService;
 
-  let userService: {
-    getUsersByLogin: ReturnType<typeof vi.fn>;
-  };
-
-  let jwtService: {
-    signAsync: ReturnType<typeof vi.fn>;
-    verifyAsync: ReturnType<typeof vi.fn>;
-  };
-
-  let configService: {
-    getOrThrow: ReturnType<typeof vi.fn>;
-  };
-
-  const user = {
-    id: 5,
-    name: 'John',
-    email: 'john@example.com',
-    login: 'john',
-    password: 'hashed-password',
-    description: null,
-    age: 25,
-    deleted: false,
-  };
-
-  const loginDto: UserLogin = {
-    login: 'john',
-    password: 'password123',
-  };
-
-  const createDto = {
-    name: 'John',
-    email: 'john@example.com',
-    login: 'john',
-    password: 'password123',
-    age: 25,
-    description: 'Test user',
-  } as UserCreateDto;
-
-  const accessToken = 'access-token';
-  const refreshToken = 'refresh-token';
-
-  const hashToken = (token: string) =>
-    createHash('sha256').update(token).digest('hex');
-
   beforeEach(() => {
-    vi.restoreAllMocks();
-
-    db = createKyselyMock();
-
-    userService = {
+    db = createDbMock();
+    users = {
       getUsersByLogin: vi.fn(),
+      getFullUserByLogin: vi.fn(),
+      createUser: vi.fn(),
+      MGetFullUserById: vi.fn(),
     };
-
-    jwtService = {
-      signAsync: vi.fn()
-        .mockResolvedValueOnce(accessToken)
-        .mockResolvedValueOnce(refreshToken),
-      verifyAsync: vi.fn(),
+    authRepo = {
+      saveRefreshToken: vi.fn(),
+      deleteRefreshToken: vi.fn().mockResolvedValue({ numDeletedRows: 1n }),
+      findRefreshToken: vi.fn(),
     };
-
-    configService = {
-      getOrThrow: vi.fn((key: string) => {
-        if (key === 'JWT_ACCESS_KEY') return 'access-secret';
-        if (key === 'JWT_REFRESH_KEY') return 'refresh-secret';
-
-        throw new Error(`Unknown config key: ${key}`);
-      }),
+    tokensHelper = {
+      generateTokens: vi.fn().mockResolvedValue(tokens),
+      getPayloadFromToken: vi.fn(),
+      hashToken: vi.fn(hash),
     };
-
+    passwords = {
+      hashPassword: vi.fn().mockResolvedValue('HASH'),
+      verifyPasswords: vi.fn(),
+    };
     service = new AuthService(
       db as unknown as Kysely<Database>,
-      userService as unknown as UserService,
-      jwtService as unknown as JwtService,
-      configService as unknown as ConfigService,
+      passwords as unknown as PasswordHelper,
+      tokensHelper as unknown as TokensHelper,
+      users as unknown as UserRepository,
+      authRepo as unknown as AuthRepository,
     );
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   describe('login', () => {
-    it('авторизует пользователя и возвращает токены', async () => {
-      userService.getUsersByLogin.mockResolvedValue(user);
-      vi.spyOn(bcrypt, 'compare').mockImplementation(() => true);
+    it('выдаёт токены и сохраняет только хеш refresh', async () => {
+      const user = makeUserRow();
+      users.getFullUserByLogin.mockResolvedValue(user);
+      users.MGetFullUserById.mockResolvedValue(user);
+      passwords.verifyPasswords.mockResolvedValue(true);
 
-      db.execute.mockResolvedValue(undefined);
+      await expect(service.login({ login: user.login, password: 'p' })).resolves.toEqual(tokens);
 
-      const result = await service.login(loginDto);
-
-      expect(userService.getUsersByLogin).toHaveBeenCalledWith('john');
-      expect(bcrypt.compare).toHaveBeenCalledWith(
-        'password123',
-        'hashed-password',
+      expect(authRepo.saveRefreshToken).toHaveBeenCalledWith(
+        hash('refresh-NEW'),
+        user.id,
+        expiresAt,
+        expect.anything(),
       );
-
-      expect(jwtService.signAsync).toHaveBeenCalledTimes(2);
-      expect(jwtService.signAsync).toHaveBeenNthCalledWith(
-        1,
-        { sub: 5, type: 'access' },
-        { secret: 'access-secret', expiresIn: '15m' },
-      );
-
-      expect(jwtService.signAsync).toHaveBeenNthCalledWith(
-        2,
-        expect.objectContaining({ sub: 5, type: 'refresh' }),
-        { secret: 'refresh-secret', expiresIn: '30d' },
-      );
-
-      expect(db.insertInto).toHaveBeenCalledWith('refresh_tokens');
-      expect(db.values).toHaveBeenCalledWith(
-        expect.objectContaining({
-          user_id: 5,
-          token_hash: hashToken(refreshToken),
-          revoked_at: null,
-        }),
-      );
-
-      expect(result).toEqual({ accessToken, refreshToken });
     });
 
-    it('выбрасывает UnauthorizedException, если пользователь не найден', async () => {
-      userService.getUsersByLogin.mockResolvedValue(undefined);
+    it('401 для неверного пароля', async () => {
+      users.getFullUserByLogin.mockResolvedValue(makeUserRow());
+      passwords.verifyPasswords.mockResolvedValue(false);
 
-      await expect(service.login(loginDto)).rejects.toThrow(
+      await expect(service.login({ login: 'x', password: 'bad' })).rejects.toBeInstanceOf(
         UnauthorizedException,
       );
-
-      expect(jwtService.signAsync).not.toHaveBeenCalled();
     });
 
-    it('выбрасывает UnauthorizedException при неправильном пароле', async () => {
-      userService.getUsersByLogin.mockResolvedValue(user);
+    it('401 для удалённого пользователя', async () => {
+      users.getFullUserByLogin.mockResolvedValue(makeUserRow({ deleted: true }));
 
-      vi.spyOn(bcrypt, 'compare').mockImplementation(async () => false);
-
-      await expect(
-        service.login({
-          login: user.login,
-          password: 'wrong-password',
-        }),
-      ).rejects.toThrow(UnauthorizedException);
-    });
-
-    it('пробрасывает ошибку поиска пользователя', async () => {
-      userService.getUsersByLogin.mockRejectedValue(
-        new Error('Database error'),
+      await expect(service.login({ login: 'x', password: 'p' })).rejects.toBeInstanceOf(
+        UnauthorizedException,
       );
-
-      await expect(service.login(loginDto)).rejects.toThrow('Database error');
+      expect(passwords.verifyPasswords).not.toHaveBeenCalled();
     });
   });
 
   describe('registration', () => {
-    it('регистрирует пользователя и возвращает токены', async () => {
-      userService.getUsersByLogin.mockResolvedValue(undefined);
+    it('создаёт пользователя и токен в одной транзакции', async () => {
+      const user = makeUserRow();
+      users.getUsersByLogin.mockResolvedValue(undefined);
+      users.createUser.mockResolvedValue(user);
+      users.MGetFullUserById.mockResolvedValue(user);
 
-      vi.spyOn(bcrypt, 'hash').mockResolvedValue(
-        'new-hashed-password' as never,
-      );
+      await service.registration(dto);
 
-      db.executeTakeFirstOrThrow.mockResolvedValue({
-        ...user,
-        password: 'new-hashed-password',
-      });
-
-      db.execute.mockResolvedValue(undefined);
-
-      const result = await service.registration(createDto);
-
-      expect(userService.getUsersByLogin).toHaveBeenCalledWith('john');
-
-      expect(bcrypt.hash).toHaveBeenCalledWith('password123', 10);
-      expect(db.transaction).toHaveBeenCalled();
-
-      expect(db.insertInto).toHaveBeenCalledWith('users');
-      expect(db.values).toHaveBeenNthCalledWith(1, {
-        ...createDto,
-        password: 'new-hashed-password',
-      });
-
-      expect(db.insertInto).toHaveBeenCalledWith('refresh_tokens');
-      expect(db.values).toHaveBeenNthCalledWith(
-        2,
-        expect.objectContaining({
-          user_id: 5,
-          token_hash: hashToken(refreshToken),
-          revoked_at: null,
-        }),
-      );
-
-      expect(result).toEqual({ accessToken, refreshToken });
-    });
-
-    it('выбрасывает HttpException, если login уже занят', async () => {
-      userService.getUsersByLogin.mockResolvedValue(user);
-
-      const hashSpy = vi.spyOn(bcrypt, 'hash');
-
-      await expect(service.registration(createDto)).rejects.toThrow(
-        HttpException,
-      );
-
-      expect(hashSpy).not.toHaveBeenCalled();
-      expect(db.transaction).not.toHaveBeenCalled();
-
-      hashSpy.mockRestore();
-    });
-
-    it('пробрасывает ошибку хеширования пароля', async () => {
-      userService.getUsersByLogin.mockResolvedValue(undefined);
-
-      vi.spyOn(bcrypt, 'hash').mockRejectedValue(
-        new Error('Hash failed'),
-      );
-
-      await expect(service.registration(createDto)).rejects.toThrow(
-        'Hash failed',
+      expect(users.createUser).toHaveBeenCalledWith({ ...dto, password: 'HASH' }, db);
+      expect(users.MGetFullUserById).toHaveBeenCalledWith(user.id, db);
+      expect(authRepo.saveRefreshToken).toHaveBeenCalledWith(
+        hash('refresh-NEW'),
+        user.id,
+        expiresAt,
+        db,
       );
     });
 
-    it('пробрасывает ошибку создания пользователя', async () => {
-      userService.getUsersByLogin.mockResolvedValue(undefined);
+    it('409, если логин занят', async () => {
+      users.getUsersByLogin.mockResolvedValue({ id: 1 });
 
-      vi.spyOn(bcrypt, 'hash').mockResolvedValue(
-        'new-hashed-password' as never,
-      );
-
-      db.executeTakeFirstOrThrow.mockRejectedValue(
-        new Error('Insert failed'),
-      );
-
-      await expect(service.registration(createDto)).rejects.toThrow(
-        'Insert failed',
-      );
-    });
-  });
-
-  describe('logout', () => {
-    it('удаляет refresh-токен и возвращает NO_CONTENT', async () => {
-      db.executeTakeFirst.mockResolvedValue({ numDeletedRows: 1n });
-
-      const result = await service.logout(refreshToken);
-
-      expect(db.deleteFrom).toHaveBeenCalledWith('refresh_tokens');
-      expect(db.where).toHaveBeenCalledWith(
-        'token_hash',
-        '=',
-        hashToken(refreshToken),
-      );
-
-      expect(result).toBe(HttpStatus.NO_CONTENT);
+      await expect(service.registration(dto)).rejects.toBeInstanceOf(ConflictException);
     });
 
-    it('возвращает NOT_FOUND, если токен не найден', async () => {
-      db.executeTakeFirst.mockResolvedValue({ numDeletedRows: 0n });
+    it('23505 при гонке превращается в 409', async () => {
+      users.getUsersByLogin.mockResolvedValue(undefined);
+      users.createUser.mockRejectedValue({ code: '23505' });
 
-      const result = await service.logout(refreshToken);
-
-      expect(result).toBe(HttpStatus.NOT_FOUND);
-    });
-
-    it('пробрасывает ошибку базы данных', async () => {
-      db.executeTakeFirst.mockRejectedValue(
-        new Error('Delete failed'),
-      );
-
-      await expect(service.logout(refreshToken)).rejects.toThrow(
-        'Delete failed',
-      );
-    });
-  });
-
-  describe('getPayloadFromToken', () => {
-    it('проверяет токен с секретом refresh-токена', async () => {
-      const payload = {
-        sub: 5,
-        type: 'refresh',
-        jti: 'token-id',
-      };
-
-      jwtService.verifyAsync.mockResolvedValue(payload);
-
-      const result = await service.getPayloadFromToken(refreshToken);
-
-      expect(jwtService.verifyAsync).toHaveBeenCalledWith(
-        refreshToken,
-        { secret: 'refresh-secret' },
-      );
-
-      expect(configService.getOrThrow).toHaveBeenCalledWith(
-        'JWT_REFRESH_KEY',
-      );
-
-      expect(result).toEqual(payload);
-    });
-
-    it('пробрасывает ошибку проверки токена', async () => {
-      jwtService.verifyAsync.mockRejectedValue(
-        new Error('Token expired'),
-      );
-
-      await expect(
-        service.getPayloadFromToken(refreshToken),
-      ).rejects.toThrow('Token expired');
+      await expect(service.registration(dto)).rejects.toBeInstanceOf(ConflictException);
     });
   });
 
   describe('refresh', () => {
-    it('обновляет токены и сохраняет новый refresh-токен', async () => {
-      db.executeTakeFirst.mockResolvedValue({
-        user_id: 5,
-        token_hash: hashToken(refreshToken),
-        revoked_at: null,
-      });
+    const found = { id: 1, user_id: 5 };
 
-      jwtService.verifyAsync.mockResolvedValue({
-        sub: 5,
-        type: 'refresh',
-        jti: 'token-id',
-      });
-
-      db.execute.mockResolvedValue(undefined);
-
-      const result = await service.refresh(refreshToken);
-
-      expect(db.transaction).toHaveBeenCalled();
-
-      expect(db.selectFrom).toHaveBeenCalledWith('refresh_tokens');
-      expect(db.where).toHaveBeenCalledWith(
-        'token_hash',
-        '=',
-        hashToken(refreshToken),
-      );
-
-      expect(db.deleteFrom).toHaveBeenCalledWith('refresh_tokens');
-
-      expect(jwtService.verifyAsync).toHaveBeenCalledWith(
-        refreshToken,
-        { secret: 'refresh-secret' },
-      );
-
-      expect(jwtService.signAsync).toHaveBeenCalledTimes(2);
-
-      expect(db.insertInto).toHaveBeenCalledWith('refresh_tokens');
-      expect(db.values).toHaveBeenCalledWith(
-        expect.objectContaining({
-          user_id: 5,
-          token_hash: hashToken(refreshToken),
-          revoked_at: null,
-        }),
-      );
-
-      expect(result).toEqual({ accessToken, refreshToken });
+    beforeEach(() => {
+      authRepo.findRefreshToken.mockResolvedValue(found);
+      tokensHelper.getPayloadFromToken.mockResolvedValue({ id: 5, type: 'refresh' });
+      users.MGetFullUserById.mockResolvedValue(makeUserRow({ id: 5 }));
     });
 
-    it('выбрасывает UnauthorizedException, если токен отсутствует в базе', async () => {
-      db.executeTakeFirst.mockResolvedValue(undefined);
+    it('хеширует новый токен ровно один раз', async () => {
+      await service.refresh('refresh-OLD');
 
-      await expect(service.refresh(refreshToken)).rejects.toThrow(
-        new UnauthorizedException('token not found'),
-      );
-
-      expect(jwtService.verifyAsync).not.toHaveBeenCalled();
+      expect(authRepo.deleteRefreshToken).toHaveBeenCalledWith(hash('refresh-OLD'), db);
+      expect(authRepo.saveRefreshToken).toHaveBeenCalledWith(hash('refresh-NEW'), 5, expiresAt, db);
     });
 
-    it('выбрасывает UnauthorizedException при недействительном токене', async () => {
-      db.executeTakeFirst.mockResolvedValue({
-        user_id: 5,
-        token_hash: hashToken(refreshToken),
-      });
+    it('401, если токена нет в БД', async () => {
+      authRepo.findRefreshToken.mockResolvedValue(undefined);
 
-      jwtService.verifyAsync.mockRejectedValue(
-        new Error('Token expired'),
-      );
-
-      await expect(service.refresh(refreshToken)).rejects.toThrow(
-        new UnauthorizedException('Invalid refresh token'),
-      );
-
-      expect(jwtService.signAsync).not.toHaveBeenCalled();
+      await expect(service.refresh('x')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(tokensHelper.generateTokens).not.toHaveBeenCalled();
     });
 
-    it('отклоняет токен с неправильным типом', async () => {
-      db.executeTakeFirst.mockResolvedValue({
-        user_id: 5,
-        token_hash: hashToken(refreshToken),
-      });
+    it('401, если параллельный запрос уже удалил токен (0 строк)', async () => {
+      authRepo.deleteRefreshToken.mockResolvedValue({ numDeletedRows: 0n });
 
-      jwtService.verifyAsync.mockResolvedValue({
-        sub: 5,
-        type: 'access',
-      });
-
-      await expect(service.refresh(refreshToken)).rejects.toThrow(
-        new UnauthorizedException('Invalid token type'),
-      );
-
-      expect(db.deleteFrom).toHaveBeenCalledWith('refresh_tokens');
-      expect(jwtService.signAsync).not.toHaveBeenCalled();
+      await expect(service.refresh('x')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(tokensHelper.generateTokens).not.toHaveBeenCalled();
     });
 
-    it('пробрасывает ошибку базы данных', async () => {
-      db.executeTakeFirst.mockRejectedValue(
-        new Error('Database error'),
-      );
+    it('401, если пользователь удалён', async () => {
+      users.MGetFullUserById.mockResolvedValue(makeUserRow({ id: 5, deleted: true }));
 
-      await expect(service.refresh(refreshToken)).rejects.toThrow(
-        'Database error',
-      );
+      await expect(service.refresh('x')).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(authRepo.saveRefreshToken).not.toHaveBeenCalled();
+    });
+
+    it('401, если это не refresh-токен', async () => {
+      tokensHelper.getPayloadFromToken.mockResolvedValue({ id: 5, type: 'access' });
+
+      await expect(service.refresh('x')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+  });
+
+  describe('logout', () => {
+    it('удаляет токен по хешу', async () => {
+      await service.logout('refresh-OLD');
+
+      expect(authRepo.deleteRefreshToken).toHaveBeenCalledWith(hash('refresh-OLD'));
     });
   });
 });

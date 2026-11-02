@@ -13,7 +13,5 @@ export const UsersListSchema = z.object({
 });
 
 export type UserListQuery = z.infer<typeof UsersListSchema>;
-export class UsersListDto extends createZodDto(UsersListSchema) {
-}
-export class UserIdParamsDto extends createZodDto(UserIdParamSchema) {
-}
+export class UsersListDto extends createZodDto(UsersListSchema) {}
+export class UserIdParamsDto extends createZodDto(UserIdParamSchema) {}

@@ -1,17 +1,13 @@
-import type { Kysely } from 'kysely'
+import type { Kysely } from 'kysely';
+import { Database } from '../database.types.js';
 
-// `any` is required here since migrations should be frozen in time. alternatively, keep a "snapshot" db interface.
-export async function up(db: Kysely<any>): Promise<void> {
+export async function up(db: Kysely<unknown>): Promise<void> {
   await db.schema
     .alterTable('users')
     .addColumn('deleted', 'boolean', (col) => col.notNull().defaultTo(false))
     .execute();
 }
 
-// `any` is required here since migrations should be frozen in time. alternatively, keep a "snapshot" db interface.
-export async function down(db: Kysely<any>): Promise<void> {
-  await db.schema
-    .alterTable('users')
-    .dropColumn('deleted')
-    .execute();
+export async function down(db: Kysely<unknown>): Promise<void> {
+  await db.schema.alterTable('users').dropColumn('deleted').execute();
 }

@@ -1,11 +1,9 @@
-import { NewUser, User } from '../user/dto/user.table.js';
 import { faker } from '@faker-js/faker';
-
-import type { Kysely } from 'kysely';
 import { vi } from 'vitest';
-import { Database } from '../database/database.types.js';
+import type { User } from '../user/dto/user.table.js';
 
-export const makeUser = (overrides: Partial<NewUser> = {}): NewUser => ({
+export const makeUserRow = (overrides: Partial<User> = {}): User => ({
+  id: faker.number.int({ min: 1, max: 10000 }),
   name: faker.person.fullName(),
   email: faker.internet.email(),
   login: `${faker.internet.username()}_${faker.string.alphanumeric(4)}`,
@@ -16,52 +14,14 @@ export const makeUser = (overrides: Partial<NewUser> = {}): NewUser => ({
   ...overrides,
 });
 
-let nextId = 1;
-export const makeUserRow = (overrides: Partial<User> = {}): User => ({
-  id: nextId++,
-  ...makeUser(),
-  ...overrides,
-});
+export const toPublicUser = ({ password: _password, deleted: _deleted, ...rest }: User) => rest;
 
-
-type MockFunction = ReturnType<typeof vi.fn>;
-
-export type KyselyMock = Record<string, MockFunction>;
-
-const CHAIN_METHODS = [
-  'selectFrom',
-  'insertInto',
-  'updateTable',
-  'deleteFrom',
-  'select',
-  'selectAll',
-  'where',
-  'values',
-  'set',
-  'returningAll',
-  'returning',
-  'orderBy',
-  'limit',
-  'offset',
-  'execute',
-  'executeTakeFirst',
-  'executeTakeFirstOrThrow',
-];
-
-export function createKyselyMock(): KyselyMock {
-  const db: KyselyMock = {};
-
-  for (const method of CHAIN_METHODS) {
-    db[method] = vi.fn().mockReturnValue(db);
-  }
-
-  db.execute = vi.fn();
-  db.executeTakeFirst = vi.fn();
-  db.executeTakeFirstOrThrow = vi.fn();
-
-  db.transaction = vi.fn().mockReturnValue({
+export function createDbMock() {
+  const db = {
+    transaction: vi.fn(),
+  };
+  db.transaction.mockReturnValue({
     execute: vi.fn((callback: (trx: unknown) => unknown) => callback(db)),
   });
-
   return db;
 }

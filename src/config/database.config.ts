@@ -1,9 +1,13 @@
 import { registerAs } from '@nestjs/config';
+import { getEnv } from './env.validation.js';
 
-export default registerAs('database', () => ({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT),
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-}));
+export default registerAs('database', () => {
+  const env = getEnv();
+  return {
+    host: env.PG_HOST,
+    port: env.PG_PORT,
+    user: env.PG_USER,
+    password: env.PG_USER_PASS,
+    database: env.PG_DB,
+  };
+});

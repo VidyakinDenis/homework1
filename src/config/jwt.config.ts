@@ -1,8 +1,12 @@
 import { registerAs } from '@nestjs/config';
+import { getEnv } from './env.validation.js';
 
-export default registerAs('jwt', () => ({
-  accessSecret: process.env.JWT_ACCESS_KEY,
-  refreshSecret: process.env.JWT_REFRESH_KEY,
-  accessExpiresIn: process.env.ACCESS_TTL_DAYS ?? '15m',
-  refreshExpiresIn: process.env.REFRESH_TTL_DAYS ?? '30d',
-}));
+export default registerAs('jwt', () => {
+  const env = getEnv();
+  return {
+    accessSecret: env.JWT_ACCESS_KEY,
+    refreshSecret: env.JWT_REFRESH_KEY,
+    accessExpiresIn: env.ACCESS_TTL_DAYS,
+    refreshExpiresIn: env.REFRESH_TTL_DAYS,
+  };
+});

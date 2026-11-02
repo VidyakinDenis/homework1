@@ -1,217 +1,302 @@
-import { UserController } from '../user.controller.js';
-import { Test } from '@nestjs/testing';
-import { UserService } from '../user.service.js';
-import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard.js';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import request from 'supertest';
+import { createHttpTestApp } from '../../shared/httpTestApp.js';
+import { makeUserRow, toPublicUser } from '../../shared/testFactories.js';
 
-import { UsersListDto } from '../dto/user-params.schema.js';
-import { UserCreateDto } from '../dto/user-create.schema.js';
-import { UserPatchDto } from '../dto/user-patch.schema.js';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { makeUser, makeUserRow } from '../../shared/testFactories.js';
+describe('HTTP: /users', () => {
+  let ctx: Awaited<ReturnType<typeof createHttpTestApp>>;
+  const server = () => ctx.app.getHttpServer();
 
-describe('UserController', () => {
-  let controller: UserController;
-
-  const userService = {
-    getUserById: vi.fn(),
-    getAllUsers: vi.fn(),
-    createUser: vi.fn(),
-    patchUser: vi.fn(),
-    deleteUserById: vi.fn(),
-  };
-
-  beforeEach(async () => {
-    vi.resetAllMocks();
-
-    const moduleRef = await Test.createTestingModule({
-      controllers: [UserController],
-      providers: [{ provide: UserService, useValue: userService }],
-    })
-      .overrideGuard(JwtAuthGuard)
-      .useValue({ canActivate: () => true })
-      .compile();
-
-    controller = moduleRef.get(UserController);
+  beforeAll(async () => {
+    ctx = await createHttpTestApp();
   });
-
-  describe('getMyProfile', () => {
-    it('возвращает профиль без пароля', async () => {
-      userService.getUserById.mockResolvedValue(makeUserRow({ id: 1, login: 'denis' }));
-
-      const result = await controller.getMyProfile({ user: { id: 1 } });
-
-      expect(userService.getUserById).toHaveBeenCalledWith(1);
-      expect(result).toMatchObject({ id: 1, login: 'denis' });
-      expect(result).not.toHaveProperty('password');
-    });
-
-    it('404, если пользователя нет', async () => {
-      userService.getUserById.mockResolvedValue(undefined);
-
-      await expect(controller.getMyProfile({ user: { id: 1 } })).rejects.toThrow(NotFoundException);
-    });
+  afterAll(async () => {
+    await ctx.app.close();
   });
+  beforeEach(() => ctx.resetMocks());
 
-  describe('getUserById', () => {
-    it('возвращает пользователя без пароля', async () => {
-      userService.getUserById.mockResolvedValue(makeUserRow({ id: 5 }));
-
-      const result = await controller.getUserById(5);
-
-      expect(userService.getUserById).toHaveBeenCalledWith(5);
-      expect(result).toMatchObject({ id: 5 });
-      expect(result).not.toHaveProperty('password');
+  describe('GET /users/my', () => {
+    it('401 без токена', async () => {
+      await request(server()).get('/api/users/my').expect(401);
     });
 
-    it('404, если пользователя нет', async () => {
-      userService.getUserById.mockResolvedValue(undefined);
+    it('200: настоящий JWT, профиль без password', async () => {
+      ctx.users.getUserById.mockResolvedValue(toPublicUser(makeUserRow({ id: 7 })));
 
-      await expect(controller.getUserById(999)).rejects.toThrow(NotFoundException);
+      const res = await request(server())
+        .get('/api/users/my')
+        .set('Authorization', await ctx.bearer(7))
+        .expect(200);
+
+      expect(ctx.users.getUserById).toHaveBeenCalledWith(7);
+      expect(res.body).not.toHaveProperty('password');
     });
 
-    it.each([-1, 0])('400 на некорректный id (%s)', async (id) => {
-      await expect(controller.getUserById(id)).rejects.toThrow(BadRequestException);
-      expect(userService.getUserById).not.toHaveBeenCalled();
+    it('401 для refresh-токена вместо access', async () => {
+      const { refreshToken } = await ctx.tokensHelper.generateTokens(7);
+
+      await request(server())
+        .get('/api/users/my')
+        .set('Authorization', `Bearer ${refreshToken}`)
+        .expect(401);
+    });
+
+    it('401, если пользователь удалён, а access-токен ещё жив', async () => {
+      ctx.users.isActive.mockResolvedValue(false);
+
+      await request(server())
+        .get('/api/users/my')
+        .set('Authorization', await ctx.bearer(7))
+        .expect(401);
+    });
+
+    it('404, если профиль не найден', async () => {
+      ctx.users.getUserById.mockResolvedValue(undefined);
+
+      await request(server())
+        .get('/api/users/my')
+        .set('Authorization', await ctx.bearer(7))
+        .expect(404);
     });
   });
 
-  describe('getAllUsers', () => {
-    it('передаёт page, pageSize и login в сервис', async () => {
-      const users = [makeUserRow(), makeUserRow()];
-      userService.getAllUsers.mockResolvedValue(users);
+  describe('GET /users/:id', () => {
+    it('200 без password', async () => {
+      ctx.users.getUserById.mockResolvedValue(toPublicUser(makeUserRow({ id: 2 })));
 
-      const result = await controller.getAllUsers({ page: 2, pageSize: 10, login: 'anna' } as UsersListDto);
+      const res = await request(server())
+        .get('/api/users/2')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(200);
 
-      expect(userService.getAllUsers).toHaveBeenCalledWith(2, 10, 'anna');
-      expect(result).toBe(users);
+      expect(res.body).not.toHaveProperty('password');
     });
 
-    it('подставляет значения по умолчанию (page=1, pageSize=20)', async () => {
-      userService.getAllUsers.mockResolvedValue([]);
+    it('400 для нечислового id', async () => {
+      await request(server())
+        .get('/api/users/abc')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(400);
+    });
+  });
 
-      await controller.getAllUsers({} as UsersListDto);
+  describe('GET /users (список)', () => {
+    it('без query: первая страница из 20 (offset 0, limit 20)', async () => {
+      ctx.users.findUsersByLogin.mockResolvedValue([]);
+      ctx.users.countUsersByLogin.mockResolvedValue({ total: 0 });
 
-      expect(userService.getAllUsers).toHaveBeenCalledWith(1, 20, undefined);
+      await request(server())
+        .get('/api/users')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(200);
+
+      expect(ctx.users.findUsersByLogin).toHaveBeenCalledWith(0, 20, undefined, expect.anything());
     });
 
-    it('приводит строки из query к числам', async () => {
-      userService.getAllUsers.mockResolvedValue([]);
+    it('page=3&pageSize=5&login=den: offset 10, один и тот же поиск для count', async () => {
+      ctx.users.findUsersByLogin.mockResolvedValue([]);
+      ctx.users.countUsersByLogin.mockResolvedValue({ total: 42 });
 
-      await controller.getAllUsers({ page: '3', pageSize: '5' } as unknown as UsersListDto);
+      const res = await request(server())
+        .get('/api/users?page=3&pageSize=5&login=den')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(200);
 
-      expect(userService.getAllUsers).toHaveBeenCalledWith(3, 5, undefined);
+      expect(ctx.users.findUsersByLogin).toHaveBeenCalledWith(10, 5, 'den', expect.anything());
+      expect(ctx.users.countUsersByLogin).toHaveBeenCalledWith('den', expect.anything());
+      expect(res.body).toMatchObject({ page: 3, pageSize: 5, total: 42, totalPages: 9 });
     });
 
-    it('пустой массив возвращается как есть, это не 404', async () => {
-      userService.getAllUsers.mockResolvedValue([]);
+    it('400 при page=0', async () => {
+      await request(server())
+        .get('/api/users?page=0')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(400);
+    });
+  });
 
-      await expect(controller.getAllUsers({} as UsersListDto)).resolves.toEqual([]);
+  describe('POST /users/create', () => {
+    const body = {
+      name: 'D',
+      login: 'denis',
+      password: 'secret123',
+      email: 'd@example.com',
+      age: 25,
+      description: 'x'.repeat(1000),
+    };
+
+    it('201: пароль хешируется, описание 1000 символов допустимо', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue(undefined);
+      ctx.users.createUser.mockResolvedValue(toPublicUser(makeUserRow()));
+
+      const res = await request(server()).post('/api/users/create').send(body).expect(201);
+
+      const [saved] = ctx.users.createUser.mock.calls[0];
+      expect(saved.password).not.toBe(body.password);
+      await expect(ctx.passwords.verifyPasswords(body.password, saved.password)).resolves.toBe(
+        true,
+      );
+      expect(res.body).not.toHaveProperty('password');
     });
 
-    it('404, если сервис вернул undefined', async () => {
-      userService.getAllUsers.mockResolvedValue(undefined);
+    it('поле deleted из тела игнорируется', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue(undefined);
+      ctx.users.createUser.mockResolvedValue(toPublicUser(makeUserRow()));
 
-      await expect(controller.getAllUsers({} as UsersListDto)).rejects.toThrow(NotFoundException);
+      await request(server())
+        .post('/api/users/create')
+        .send({ ...body, deleted: true })
+        .expect(201);
+
+      expect(ctx.users.createUser.mock.calls[0][0]).not.toHaveProperty('deleted');
+    });
+
+    it('409, если логин занят', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue({ id: 1 });
+
+      await request(server()).post('/api/users/create').send(body).expect(409);
+    });
+
+    it('409, если БД вернула нарушение unique (23505) при гонке', async () => {
+      ctx.users.getUsersByLogin.mockResolvedValue(undefined);
+      ctx.users.createUser.mockRejectedValue({
+        code: '23505',
+        detail: 'Key (email)=(d@example.com) already exists.',
+      });
+
+      const res = await request(server()).post('/api/users/create').send(body).expect(409);
+      expect(res.body.message).toContain('email');
+    });
+
+    it('400 при описании длиннее 1000 символов', async () => {
+      await request(server())
+        .post('/api/users/create')
+        .send({ ...body, description: 'x'.repeat(1001) })
+        .expect(400);
+    });
+  });
+
+  describe('PATCH /users/:id', () => {
+    it('401 без токена', async () => {
+      await request(server()).patch('/api/users/1').send({ name: 'x' }).expect(401);
+    });
+
+    it('403 при изменении чужого профиля', async () => {
+      await request(server())
+        .patch('/api/users/2')
+        .set('Authorization', await ctx.bearer(1))
+        .send({ name: 'x' })
+        .expect(403);
+
+      expect(ctx.users.patchUser).not.toHaveBeenCalled();
+    });
+
+    it('200: пароль хешируется перед записью', async () => {
+      ctx.users.patchUser.mockResolvedValue({ id: 1, name: 'x' });
+
+      await request(server())
+        .patch('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .send({ password: 'new-secret' })
+        .expect(200);
+
+      const [saved] = ctx.users.patchUser.mock.calls[0];
+      expect(saved.password).not.toBe('new-secret');
+      await expect(ctx.passwords.verifyPasswords('new-secret', saved.password)).resolves.toBe(true);
+    });
+
+    it('пароль с пробелами по краям не обрезается', async () => {
+      ctx.users.patchUser.mockResolvedValue({ id: 1 });
+
+      await request(server())
+        .patch('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .send({ password: ' pass word ' })
+        .expect(200);
+
+      const [saved] = ctx.users.patchUser.mock.calls[0];
+      await expect(ctx.passwords.verifyPasswords(' pass word ', saved.password)).resolves.toBe(
+        true,
+      );
     });
 
     it.each([
-      ['page не число', { page: 'abc' }],
-      ['page меньше 1', { page: 0 }],
-      ['pageSize больше 100', { pageSize: 101 }],
-      ['пустой login', { login: '' }],
-    ])('400: %s', async (_name, query) => {
-      await expect(controller.getAllUsers(query as unknown as UsersListDto)).rejects.toThrow(BadRequestException);
-      expect(userService.getAllUsers).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('CreateUser', () => {
-    it('создаёт пользователя по валидному телу', async () => {
-      const created = makeUserRow({ login: 'denis' });
-      userService.createUser.mockResolvedValue(created);
-
-      const result = await controller.CreateUser(makeUser({ login: 'denis' }) as UserCreateDto);
-
-      expect(userService.createUser).toHaveBeenCalledWith(expect.objectContaining({ login: 'denis' }));
-      expect(result).toBe(created);
-    });
-
-    it('подставляет deleted=false по умолчанию', async () => {
-      userService.createUser.mockResolvedValue(makeUserRow());
-      const { deleted, ...body } = makeUser();
-
-      await controller.CreateUser(body as UserCreateDto);
-
-      expect(userService.createUser).toHaveBeenCalledWith(expect.objectContaining({ deleted: false }));
-    });
-
-    it.each([
-      ['короткий логин', { login: 'ab' }],
-      ['короткий пароль', { password: '12345' }],
-      ['невалидный email', { email: 'not-an-email' }],
-      ['отрицательный возраст', { age: -1 }],
+      ['пустое тело', {}],
       ['дробный возраст', { age: 20.5 }],
-      ['слишком длинное описание', { description: 'x'.repeat(301) }],
-      ['пустое имя', { name: '   ' }],
-    ])('400: %s', async (_name, override) => {
-      const body = makeUser(override) as UserCreateDto;
-
-      await expect(controller.CreateUser(body)).rejects.toThrow(BadRequestException);
-      expect(userService.createUser).not.toHaveBeenCalled();
+      ['отрицательный возраст', { age: -1 }],
+      ['слишком длинное описание', { description: 'x'.repeat(1001) }],
+    ])('400: %s', async (_name, body) => {
+      await request(server())
+        .patch('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .send(body)
+        .expect(400);
     });
 
-    it('400 на пустое тело', async () => {
-      await expect(controller.CreateUser({} as UserCreateDto)).rejects.toThrow(BadRequestException);
-    });
-  });
+    it('200: возраст 0 допустим', async () => {
+      ctx.users.patchUser.mockResolvedValue({ id: 1 });
 
-  describe('patchUser', () => {
-    it('обновляет и возвращает пользователя без пароля', async () => {
-      userService.patchUser.mockResolvedValue(makeUserRow({ id: 5, name: 'New name' }));
-
-      const result = await controller.patchUser(5, { name: 'New name' } as UserPatchDto);
-
-      expect(userService.patchUser).toHaveBeenCalledWith({ name: 'New name' }, 5);
-      expect(result).toMatchObject({ id: 5, name: 'New name' });
-      expect(result).not.toHaveProperty('password');
+      await request(server())
+        .patch('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .send({ age: 0 })
+        .expect(200);
     });
 
-    it('обрезает пробелы в строках (trim)', async () => {
-      userService.patchUser.mockResolvedValue(makeUserRow());
+    it('404, если пользователь пропал или удалён (NoResultError из БД)', async () => {
+      const { NoResultError } = await import('kysely');
+      ctx.users.patchUser.mockRejectedValue(new NoResultError({} as never));
 
-      await controller.patchUser(5, { name: '  Denis  ' } as UserPatchDto);
-
-      expect(userService.patchUser).toHaveBeenCalledWith({ name: 'Denis' }, 5);
-    });
-
-    it('400 на некорректный id', async () => {
-      await expect(controller.patchUser(-1, { name: 'x' } as UserPatchDto)).rejects.toThrow(BadRequestException);
-      expect(userService.patchUser).not.toHaveBeenCalled();
-    });
-
-    it.each([
-      ['age не число', { age: 'abc' }],
-      ['age равен 0', { age: 0 }],
-      ['невалидный email', { email: 'nope' }],
-      ['пустое имя', { name: '' }],
-    ])('400 на некорректное тело: %s', async (_name, body) => {
-      await expect(controller.patchUser(5, body as unknown as UserPatchDto)).rejects.toThrow(BadRequestException);
-      expect(userService.patchUser).not.toHaveBeenCalled();
+      await request(server())
+        .patch('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .send({ name: 'x' })
+        .expect(404);
     });
   });
 
-  describe('deleteUserById', () => {
-    it('удаляет пользователя и возвращает результат сервиса', async () => {
-      userService.deleteUserById.mockResolvedValue(true);
-
-      await expect(controller.deleteUserById(5)).resolves.toBe(true);
-      expect(userService.deleteUserById).toHaveBeenCalledWith(5);
+  describe('DELETE /users/:id', () => {
+    it('401 без токена', async () => {
+      await request(server()).delete('/api/users/1').expect(401);
     });
 
-    it('400 на некорректный id', async () => {
-      await expect(controller.deleteUserById(0)).rejects.toThrow(BadRequestException);
-      expect(userService.deleteUserById).not.toHaveBeenCalled();
+    it('403 при удалении чужого аккаунта', async () => {
+      await request(server())
+        .delete('/api/users/2')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(403);
+
+      expect(ctx.users.deleteUserById).not.toHaveBeenCalled();
+    });
+
+    it('200: ответ без password', async () => {
+      ctx.users.deleteUserById.mockResolvedValue(toPublicUser(makeUserRow({ id: 1 })));
+
+      const res = await request(server())
+        .delete('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(200);
+
+      expect(res.body).not.toHaveProperty('password');
+    });
+
+    it('404, если аккаунт уже удалён', async () => {
+      ctx.users.deleteUserById.mockResolvedValue(undefined);
+
+      await request(server())
+        .delete('/api/users/1')
+        .set('Authorization', await ctx.bearer(1))
+        .expect(404);
+    });
+  });
+
+  it('единый формат ошибок: { statusCode, error, message }', async () => {
+    const res = await request(server()).get('/api/users/my').expect(401);
+
+    expect(res.body).toEqual({
+      statusCode: 401,
+      error: 'Unauthorized',
+      message: 'user is not authorized',
     });
   });
 });

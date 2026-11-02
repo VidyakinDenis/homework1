@@ -1,72 +1,92 @@
-import { BadRequestException, Body, Controller, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Req,
+  Res,
+  UnauthorizedException,
+} from '@nestjs/common';
+import {
+  ApiCreatedResponse,
+  ApiNoContentResponse,
+  ApiOkResponse,
+  ApiOperation,
+} from '@nestjs/swagger';
 import { AuthService } from './auth.service.js';
-import { UserCreate, UserCreateDto } from '../user/dto/user-create.schema.js';
-import { UserCreateSchema } from '../user/dto/user-create.schema.js';
-import { UserLogin, UserLoginDto } from './dto/userLogin.schema.js';
-import { UserLoginSchema } from './dto/userLogin.schema.js';
-import { RefreshTokenDto, RefreshTokenSchema, TokensPairDto } from './dto/tokens.schema.js';
-import { JwtAuthGuard } from './guards/jwt-auth.guard.js';
-import { ApiBearerAuth, ApiNoContentResponse, ApiOkResponse, ApiOperation, ApiQuery } from '@nestjs/swagger';
-import { UserResponseDto } from '../user/dto/user-response.dto.js';
+import { UserCreateDto } from '../user/dto/user-create.schema.js';
+import { UserLoginDto } from './dto/userLogin.schema.js';
+import { RefreshTokenDto, TokensPairDto } from './dto/tokens.schema.js';
+import { TokensHelper } from './helpers/tokens-helper.js';
+import type { Request, Response } from 'express';
+import { Public } from './guards/public.decorator.js';
 
 @Controller('auth')
 export class AuthController {
+  constructor(
+    private readonly authService: AuthService,
+    private readonly cookieHelper: TokensHelper,
+  ) {}
 
-  constructor(private readonly authService: AuthService) {}
-
-  @Post("/login")
-  @ApiOkResponse({ type: UserLoginDto })
-  @ApiOperation({
-    summary: 'получить токены',
-    description: 'Возвращает пару токенов',
-  })
-  async login(@Body() userDto: UserLoginDto) {
-    const result = UserLoginSchema.safeParse(userDto);
-    if (!result.success) {
-      throw new BadRequestException(result.error.flatten());
-    }
-    return await this.authService.login(result.data);
-  }
-
-  @Post("/registration")
+  @Post('/login')
+  @Public()
+  @HttpCode(HttpStatus.OK)
   @ApiOkResponse({ type: TokensPairDto })
   @ApiOperation({
-    summary: 'Зарегестрировать пользователя',
+    summary: 'Получить токены',
     description: 'Возвращает пару токенов',
   })
-  async registration(@Body() userDto: UserCreateDto) {
-    const result = UserCreateSchema.safeParse(userDto);
-    if (!result.success) {
-      throw new BadRequestException(result.error.flatten());
-    }
-    return await this.authService.registration(result.data);
+  async login(@Body() body: UserLoginDto, @Res({ passthrough: true }) res: Response) {
+    const tokens = await this.authService.login(body);
+    this.cookieHelper.set(res, tokens.refreshToken, tokens.refreshExpiresAt);
+    return tokens.accessToken;
   }
 
+  @Post('/registration')
+  @Public()
+  @ApiCreatedResponse({ type: TokensPairDto })
+  @ApiOperation({
+    summary: 'Зарегистрировать пользователя',
+    description: 'Возвращает пару токенов',
+  })
+  async registration(@Body() body: UserCreateDto, @Res({ passthrough: true }) res: Response) {
+    const tokens = await this.authService.registration(body);
+    this.cookieHelper.set(res, tokens.refreshToken, tokens.refreshExpiresAt);
+    return tokens.accessToken;
+  }
 
-  @Post("/logout")
-  @ApiNoContentResponse({ description: 'Токен отозван' })
+  @Post('/logout')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiNoContentResponse({ description: 'Токен отозван' })
   @ApiOperation({
-    summary: 'Деавторизировать пользоватекля',
-    description: 'отзывает рефреш токен',
+    summary: 'Деавторизировать пользователя',
+    description: 'Отзывает рефреш-токен',
   })
-  async logout(@Body() refreshToken: RefreshTokenDto) {
-    const result = RefreshTokenSchema.safeParse(refreshToken);
-    if (!result.success) throw new BadRequestException(result.error.flatten());
-    return await this.authService.logout(result.data.refreshToken);
+  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const token = this.cookieHelper.read(req);
+    if (token) await this.authService.logout(token);
+    this.cookieHelper.clear(res);
   }
 
-  @Post("/refresh")
+  @Post('/refresh')
+  @HttpCode(HttpStatus.OK)
   @ApiOkResponse({ type: TokensPairDto })
   @ApiOperation({
-    summary: 'получить токены',
+    summary: 'Обновить токены',
     description: 'Возвращает пару токенов и отзывает полученный рефреш',
   })
-  async refresh(@Body() refreshToken: RefreshTokenDto) {
-    const result = RefreshTokenSchema.safeParse(refreshToken);
-    if (!result.success) throw new BadRequestException(result.error.flatten());
-    return await this.authService.refresh(result.data.refreshToken);
+  @Public()
+  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const refreshToken = this.cookieHelper.read(req);
+    if (!refreshToken) throw new UnauthorizedException('Refresh token is missing');
+    try {
+      const tokens = await this.authService.refresh(refreshToken);
+      this.cookieHelper.set(res, tokens.refreshToken, tokens.refreshExpiresAt);
+      return tokens.accessToken;
+    } catch (err) {
+      this.cookieHelper.clear(res);
+      throw err;
+    }
   }
-
-
 }
